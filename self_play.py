@@ -103,7 +103,9 @@ class SelfPlay:
             self.game.render()
 
         with torch.no_grad():
-            while not done and len(game_history.action_history) <= self.config.max_moves:
+            while (
+                not done and len(game_history.action_history) <= self.config.max_moves
+            ):
                 root = MCTS(self.config).run(
                     self.model,
                     observation,
@@ -124,10 +126,10 @@ class SelfPlay:
                     print(
                         "Player {} turn. MuZero suggests {}".format(
                             self.game.to_play(),
-                            self.game.output_action(self.select_action(root, 0)),
+                            self.game.print_action(self.select_action(root, 0)),
                         )
                     )
-                    action = self.game.input_action()
+                    action = self.game.human_action()
                 elif opponent == "random":
                     action = numpy.random.choice(self.game.legal_actions())
                 else:
@@ -142,9 +144,8 @@ class SelfPlay:
                 )
 
                 if render:
-                    print("Played action: {}".format(self.game.output_action(action)))
+                    print("Played action: {}".format(self.game.print_action(action)))
                     self.game.render()
-
 
                 game_history.store_search_statistics(root, self.config.action_space)
 
@@ -164,15 +165,28 @@ class SelfPlay:
         stacked_observations = observation.copy()
         for i in range(num_stacked_observations):
             try:
-                previous_observation = game_history.observation_history[-i - 1][
-                    : observation.shape[0]
-                ]
+                previous_observation = numpy.concatenate(
+                    (
+                        game_history.observation_history[-i - 1][
+                            : observation.shape[0]
+                        ],
+                        [
+                            numpy.ones_like(observation[0])
+                            * game_history.action_history[-i - 1]
+                        ],
+                    ),
+                    axis=0,
+                )
             except IndexError:
-                previous_observation = numpy.zeros_like(observation)
+                previous_observation = numpy.concatenate(
+                    (numpy.zeros_like(observation), [numpy.zeros_like(observation[0])]),
+                    axis=0,
+                )
 
             stacked_observations = numpy.concatenate(
                 (stacked_observations, previous_observation), axis=0
             )
+
         return stacked_observations
 
     @staticmethod
@@ -201,7 +215,7 @@ class SelfPlay:
         return action
 
 
-# Game independant
+# Game independent
 class MCTS:
     """
     Core Monte Carlo Tree Search algorithm.
@@ -227,12 +241,8 @@ class MCTS:
             .unsqueeze(0)
             .to(next(model.parameters()).device)
         )
-        _, reward, policy_logits, hidden_state = model.initial_inference(
-            observation
-        )
-        reward = self.support_to_scalar(
-            reward, self.config.support_size
-        )
+        _, reward, policy_logits, hidden_state = model.initial_inference(observation)
+        reward = self.support_to_scalar(reward, self.config.support_size)
         root.expand(
             legal_actions, to_play, reward, policy_logits, hidden_state,
         )
@@ -276,7 +286,9 @@ class MCTS:
                 hidden_state,
             )
 
-            self.backpropagate(search_path, value.item(), virtual_to_play, min_max_stats)
+            self.backpropagate(
+                search_path, value.item(), virtual_to_play, min_max_stats
+            )
 
         return root
 
@@ -303,7 +315,13 @@ class MCTS:
         pb_c *= math.sqrt(parent.visit_count) / (child.visit_count + 1)
 
         prior_score = pb_c * child.prior
-        value_score = min_max_stats.normalize(child.value())
+
+        if child.visit_count > 0:
+            value_score = min_max_stats.normalize(
+                child.reward + self.config.discount * child.value()
+            )
+        else:
+            value_score = 0
 
         return prior_score + value_score
 
@@ -312,7 +330,7 @@ class MCTS:
         At the end of a simulation, we propagate the evaluation all the way up the tree
         to the root.
         """
-        for node in search_path:
+        for node in reversed(search_path):
             node.value_sum += value if node.to_play == to_play else -value
             node.visit_count += 1
             min_max_stats.update(node.value())
@@ -326,13 +344,14 @@ class MCTS:
         See paper appendix Network Architecture
         """
         # Decode to a scalar
-        probs = torch.softmax(logits, dim=1)
+        probabilities = torch.softmax(logits, dim=1)
         support = (
             torch.tensor([x for x in range(-support_size, support_size + 1)])
-            .expand(probs.shape)
-            .to(device=probs.device)
+            .expand(probabilities.shape)
+            .float()
+            .to(device=probabilities.device)
         )
-        x = torch.sum(support * probs, dim=1, keepdim=True)
+        x = torch.sum(support * probabilities, dim=1, keepdim=True)
 
         # Invert the scaling (defined in https://arxiv.org/abs/1805.11593)
         x = torch.sign(x) * (
@@ -400,6 +419,7 @@ class GameHistory:
         self.root_values = []
 
     def store_search_statistics(self, root, action_space):
+        # Turn visit count from root into a policy
         sum_visits = sum(child.visit_count for child in root.children.values())
         self.child_visits.append(
             [
@@ -407,6 +427,7 @@ class GameHistory:
                 for a in action_space
             ]
         )
+
         self.root_values.append(root.value())
 
 
